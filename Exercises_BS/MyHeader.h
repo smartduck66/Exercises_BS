@@ -16,6 +16,7 @@ Revised August 16, 2018: open file added
 #include<string>
 #include<iostream>
 #include<fstream>
+#include<chrono>
 
 using namespace std;
 
@@ -85,4 +86,11 @@ ofstream open_file_write(string filename)
 	return ost;
 }
 
+template <typename TFunc> void RunAndMeasure(TFunc func)
+{
+	const auto start = chrono::steady_clock::now();
+	func();
+	const auto end = chrono::steady_clock::now();
+	cout << chrono::duration <double, milli>(end - start).count() << " ms\n";
+}
 #endif
