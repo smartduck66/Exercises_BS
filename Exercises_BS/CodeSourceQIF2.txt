@@ -1,0 +1,1376 @@
+//
+// Traitement d'un fichier de données issu de Banktivity exporté au format QIF - Version 2 "GUI"
+// https://en.wikipedia.org/wiki/Quicken_Interchange_Format
+// Commit initial : 06/10/2018 
+// Commit en cours : 09/11/2020 - Optimisations diverses
+// Caractères spéciaux : [ ]   '\n'   {  }   ||   ~   _     @
+// Paramétrage IDE VS:	C/C++: Général/Compilation multiprocesseur/OUI (debug/release)
+//						C/C++: Avancé/Désactivation des avertissements spécifiques/4996
+//						C/C++: Langage/Niveau du langage/C++17
+//						C/C++: Génération de code/'DLL de débogage MultiThread' en debug et 'DLL MultiThread' en release -> Compilation dynamique (DLL) et non statique
+//						C/C++: Préprocesseur/Rajout de WIN32_LEAN_AND_MEAN dans les définitions pour éviter l'erreur WinSock causée par Boost sous Windows
+//
+// Librairies nécessaires (chemins + noms de la librairies à indiquer dans Editeur de liens/Entrée) :
+// FLTK 1.4, Libsodium 1.0.16, SQLite 3.28.0, Boost 1.72, OpenSSL 1.0.2 (supporté jusqu'au 31/12/2019 -> Ensuite, passer sur la 1.1.1)
+
+// #include "pch.h"		// En-tête indispensable sous Windows et VC++ si l'on veut utiliser des en-têtes pré-compilés
+
+#include "MyHeader.h"	// Mon header générique
+#include "MyFLTK.h"		// Code spécifique incluant des fonctions graphiques
+#include "QIF.h"		// En-tête spécifique au projet QIF (fonctionnel)
+
+#include <map>
+#include <optional>
+#include <iomanip>		// setw
+#include <numeric>		// accumulate
+#include <sstream>
+#include <cmath>
+#include <clocale>		// setlocale
+#include <sodium.h>
+#include <time.h>
+#include <iterator>
+#include <algorithm>
+
+using namespace std;
+using namespace QIF_lib;
+using namespace Graph_lib;
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------- fenêtre des tests de nouvelles fonctionnalités
+struct Test : Simple_window {
+
+	Test(Point xy, int w, int h, const string& title);
+
+	~Test()
+	{
+
+	}
+
+
+private:
+	Button quit_button;
+	//Table myTable;
+	//In_box_multiline myML;
+	//Text_Editor myEditor;
+	Out_box G_tty;
+
+	// actions invoked by callbacks
+	void quit();
+
+	// callbacks functions
+	static void cb_quit(Address, Address);
+
+};
+
+Test::Test(Point xy, int w, int h, const string& title)			// Constructeur
+	:Simple_window(xy, w, h, title),
+	//myTable(Point(20, 20), 860, 460, "Démonstration d'un tableau", 0, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt),
+	//myML(Point(20, 20), 800, 400, ""),
+	//myEditor(Point(20, 20), 800, 400, "", "test"),
+	G_tty(Point(x_max() - 800, y_max() - 50), 600, 20, ""),
+	quit_button(Point(x_max() / 2 - 100, y_max() - 50), 200, 20, "Quitter", cb_quit)
+
+{
+
+
+	// Apparition des éléments graphiques ------------------------------------------
+	//attach(myTable);
+	//myTable.draw_cell(Fl_Table::TableContext::CONTEXT_CELL, 4, 5, 50, 50, 80, 20); // Normalement cette fonction ne doit jamais être appelée directement
+	//attach(myML);
+	//myML.put("EDF - GDF (Vaucresson)\nEDF - GDF (Vaucresson)\nAssurance MRH Vaucresson\nImpôts fonciers (Vaucresson)\n");
+		
+	//attach(myEditor);
+	//myEditor.put("Test");
+	// Simulation de solde d'épargne : on démarre du 1er jour sans salaire (préavis terminé) - 1er avril 2021 *********************************************************************
+	attach(G_tty);
+	int chargesimmo = 5000;
+	int epargne = 86000+30000;	// Bonus
+	int indemnite = 17500*3+10000+10000;
+	int vente_avz = 103000;		// Prise en compte d'une vente moins favorable (-20k de moins si vente de l'appt avec bail commercial P&V)
+	int vente_arbo = 433000;
+	int liquidation_Art83 = 80000;
+	int remb_partiel_paris = 66000;
+	int remb_partiel_vaucresson2 = 200000;
+	int voyages = 60000;
+	int mens_audencia = 2000;
+	int solde_audencia = 6000;
+
+	epargne += indemnite;
+	auto [day, month, year] = date_now();
+	day = 1;
+	month = 4;
+	year = 2021;
+	int reset = 0;
+
+	for (int annee = year; annee < 2032; ++annee) {
+		
+		for (int mois = (annee == year ? month : 1); mois < 13; ++mois) {				// Test ternaire : si nous sommes dans l'année en cours, on prend le mois en cours également
+
+			if ((annee == 2020 && mois > 9) || (annee == 2021 && mois < 6)) { epargne -= mens_audencia; }
+			if (annee == 2021 && mois == 9) { epargne += vente_avz; chargesimmo = 3000; }	 
+			if (annee == 2021 && mois == 10) { epargne -= solde_audencia; }
+			if (annee == 2022 && mois == 12) { epargne += vente_arbo; }						
+			if (annee == 2026 && mois == 8) { epargne -= remb_partiel_paris; chargesimmo = 2000;}
+			if (annee == 2026 && mois == 11) { epargne -= remb_partiel_vaucresson2; }
+
+			++reset;													// On incrémente le compteur des mois sans revenus
+			if (reset < 7 || reset > 36) { epargne -= chargesimmo; }	// On décrémente l'épargne des charges immo. les mois de carence et passés les 30 mois de chômage
+			if (reset == 37) { epargne += liquidation_Art83; }			// Dès que les droits chômage sont terminés, on peut liquider le Perco et les 2 art. 83
+			//cout << epargne << endl;
+		}
+
+
+	}
+
+	epargne -= voyages;
+	epargne += chargesimmo;	// On annule le mois de décembre 2031 car les pensions de retraite prennent le relai
+
+	string resultat = "Le solde épargne est de " + to_string(epargne) + " euros en ne touchant plus de revenus dès le "+to_string(day)+"/"+to_string(month)+"/"+to_string(year);
+
+	G_tty.put(resultat);	// Test
+
+	
+}
+
+void Test::cb_quit(Address, Address pw)			// "the usual"
+{
+	reference_to<Test>(pw).quit();
+}
+
+void Test::quit()
+{
+	// A priori inutile si hide() détruit bien les widgets attachés à la fenêtre
+	detach(quit_button);
+
+	hide();			// curious FLTK idiom for delete window
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------- fenêtre du tableau d'amortissement (TA)
+struct TA : Simple_window {
+
+	TA(Point xy, int w, int h, const string& title, const vector <TA_results>& TA);	// On se sert du pattern Dependency Injection (DI) pour passer des data entre objets, en l'occurence 'TA'
+
+	~TA()
+	{
+
+	}
+
+
+private:
+	Button quit_button;
+	Out_static_box tab_title, cout_total_title;
+	Out_box cout_total;
+	dropdown_list tab_list;
+	
+	// actions invoked by callbacks
+	void quit();
+
+	// callbacks functions
+	static void cb_quit(Address, Address);
+
+};
+
+TA::TA(Point xy, int w, int h, const string& title, const vector <TA_results>& TA)			// Constructeur
+	:Simple_window(xy, w, h, title),
+	tab_title(Point(10, 10), 700, 30, "Echéance   Mensualité   Amortissement      Intérêts             C.R.D.             Assurance", Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt),
+	tab_list(Point(10, 30), 620, 750, "", 0),	// Pas de CallBack sur cette liste déroulante
+	cout_total_title(Point(10, 800), 200, 30, "Coût total de l'emprunt :", Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt),
+	cout_total(Point(220, 800), 100, 20, ""),
+	quit_button(Point(x_max() / 2 - 100, y_max() - 50), 200, 20, "Quitter", cb_quit)
+
+{
+	
+	// Apparition des éléments graphiques ------------------------------------------
+	attach(tab_title);
+	attach(tab_list);
+	attach(cout_total_title);
+	attach(cout_total);
+
+	double coutTotalCredit = 0.0;
+	
+	for (const auto& x : TA) {
+		
+		stringstream ss{};
+		ss << setw(6) << right << x.echeance << setw(14) << right << d2s(x.mensualiteAC, 2) << setw(15) << right << d2s(x.amortissement, 2) << setw(15) << right << d2s(x.interets, 2)
+			<< setw(15) << right << d2s(abs(x.capitalrestant), 2) << setw(15) << right << d2s(x.coutAssurance, 2);
+
+		tab_list.put(ss.str());
+
+		coutTotalCredit += x.interets;
+		coutTotalCredit += x.coutAssurance;
+	
+	}
+	
+	// Affichage du coût total du crédit
+	cout_total.put(d2s(coutTotalCredit,2));
+}
+
+void TA::cb_quit(Address, Address pw)			// "the usual"
+{
+	reference_to<TA>(pw).quit();
+}
+
+void TA::quit()
+{
+	// A priori inutile si hide() détruit bien les widgets attachés à la fenêtre
+	detach(quit_button);
+
+	hide();			// curious FLTK idiom for delete window
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------- fenêtre du TOP50 des dépenses
+struct TOP50 : Simple_window {
+
+	TOP50(Point xy, int w, int h, const string& title, const vector <TOP50_results>& TOP50, const int& nb_year_depenses);	// On se sert du pattern Dependency Injection (DI) pour passer des data entre objets
+
+	~TOP50()
+	{
+
+	}
+
+
+private:
+	Button quit_button;
+	Out_static_box tab_title;
+	Out_box cout_total;
+	dropdown_list tab_list;
+	Vector_ref <Graph_lib::Out_static_box> depenses_result{};
+
+	// actions invoked by callbacks
+	void quit();
+
+	// callbacks functions
+	static void cb_quit(Address, Address);
+
+};
+
+TOP50::TOP50(Point xy, int w, int h, const string& title, const vector <TOP50_results>& TOP50, const int& nb_year_depenses)			// Constructeur
+	:Simple_window(xy, w, h, title),
+	tab_title(Point(10, 10), 700, 30, "Dépenses          Catégories", 
+		Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt),
+	tab_list(Point(10, 30), 620, 760, "", 0),	// Pas de CallBack sur cette liste déroulante
+	cout_total(Point(20, 800), 70, 20, ""),
+	quit_button(Point(x_max() / 2 - 100, y_max() - 50), 200, 20, "Quitter", cb_quit)
+
+{
+
+	// Apparition des éléments graphiques ------------------------------------------
+	attach(tab_title);
+	attach(tab_list);
+	attach(cout_total);
+
+	double Total_depenses = 0.0;
+		
+	for	(int i = 0; i < (TOP50.size() > 50 ? 50 : TOP50.size()); ++i) {
+		
+		stringstream ss{};
+		ss << setw(8) << right << d2s(TOP50[i].cumul, 0) << "        " <<setw(60) << left << ws2s(TOP50[i].libelle);
+		tab_list.put(ss.str());
+
+		Total_depenses += TOP50[i].cumul;
+		
+	}
+
+	// Affichage du total des dépenses (éventuellement moyennées)
+	cout_total.put(d2s(Total_depenses, 0));
+	string cumul_depenses = "Cumul total des dépenses";
+	if (nb_year_depenses > 1) cumul_depenses += " (moyenne annuelle : " + d2s(Total_depenses / nb_year_depenses,0) + " euros)";
+	depenses_result.push_back(new Graph_lib::Out_static_box{ Point{ 125, 803 },500, 30, cumul_depenses, Font::helvetica_italic, nullopt, nullopt, nullopt, nullopt, nullopt });
+	attach(depenses_result[0]);
+
+}
+
+void TOP50::cb_quit(Address, Address pw)			// "the usual"
+{
+	reference_to<TOP50>(pw).quit();
+}
+
+void TOP50::quit()
+{
+	// A priori inutile si hide() détruit bien les widgets attachés à la fenêtre
+	detach(quit_button);
+
+	hide();			// curious FLTK idiom for delete window
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------- fenêtre des paramètres
+struct Params : Simple_window {
+
+	Params(Point xy, int w, int h, const string& title);
+
+	~Params()
+	{
+
+	}
+		
+	// Données
+	vector<string>website_key, directory_path {};	// On garde ces vecteurs au niveau du constructeur afin de pouvoir utiliser leur valeur dans le bouton "save"
+	
+private:
+	Button save_button;
+	In_box_multiline Params1_ML;
+	Vector_ref <Graph_lib::In_box>Params2, Params3 {};
+	Vector_ref <Graph_lib::Out_static_box>titles_params2, titles_params3, Params_titles {};
+		
+	// actions invoked by callbacks
+	void save();
+	
+	// callbacks functions
+	static void cb_save(Address, Address);
+	
+};
+
+Params::Params(Point xy, int w, int h, const string& title)			// Constructeur
+	:Simple_window(xy, w, h, title),
+	Params1_ML(Point(10, 50), 300, 500, ""),
+	save_button(Point(x_max()/2 - 100, y_max()-50), 200, 20, "Sauvegarder et fermer", cb_save)
+	
+{
+	// Ouverture de la base de données en lecture
+	auto in = open_db_read("QIF2_params.db3");
+	
+	// Affichage des en-têtes
+	static const int nb_colonnes = 3;
+	static char titles_labels[nb_colonnes][40]{ "Opérations cumulées","Clés des sites Web","Fichiers Répertoires" };
+	static int coord_x[nb_colonnes]{ 10,350,350 }; 
+	static int coord_y[nb_colonnes]{ 30,30,150 };
+		
+	for (int col = 0; col < nb_colonnes; ++col) {
+		Params_titles.push_back(new Graph_lib::Out_static_box{ Point{ coord_x[col], coord_y[col] },320, 30,titles_labels[col],Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt,nullopt });
+		attach(Params_titles[col]);
+
+	}
+	
+	// Opérations cumulées -----------------------------------------------
+	SQLite::Statement query1(in, "SELECT * FROM CumulOps");
+
+	// La table entière est 'balayée'
+	vector<wstring>CumulOps{};
+	while (query1.executeStep()) {
+		string label = query1.getColumn(0);
+		CumulOps.push_back(s2ws(label));
+
+	}
+
+	// Affichage des lignes
+	string ss{};
+	for (auto x: CumulOps)
+		ss += ws2s(x) + '\n';
+	attach(Params1_ML);
+	Params1_ML.put(ss);
+	
+	// Clés des sites Web -----------------------------------------------------------------------------
+	SQLite::Statement query2(in, "SELECT * FROM WebsiteKey");
+	vector<string>website_name{};
+	
+	while (query2.executeStep()) {
+		website_key.push_back(query2.getColumn(1));
+		website_name.push_back(query2.getColumn(2));
+						
+	}
+	
+	for (int i = 0; i < website_key.size(); ++i) {
+		Params2.push_back(new Graph_lib::In_box{ Point{ coord_x[1]+10, coord_y[1] + 20 + i * 20 },200, 20, "" });
+		attach(Params2[i]);
+		Params2[i].put(website_key[i]);	// Idem qu'au dessus
+		titles_params2.push_back(new Graph_lib::Out_static_box{ Point{ coord_x[1] + 220, coord_y[1] + 20 + i * 20 },250, 20, website_name[i],nullopt, nullopt, nullopt, nullopt, nullopt, nullopt });
+		attach(titles_params2[i]);
+
+	}
+	
+	// Répertoires -----------------------------------------------------------------------------
+	SQLite::Statement query3(in, "SELECT * FROM Directory");
+	vector<string>directory_name{};
+
+	while (query3.executeStep()) {
+		directory_path.push_back(query3.getColumn(1));
+		directory_name.push_back(query3.getColumn(2));
+
+	}
+
+	for (int i = 0; i < directory_path.size(); ++i) {
+		Params3.push_back(new Graph_lib::In_box{ Point{ coord_x[2] + 10, coord_y[2] + 20 + i * 20 },200, 20, "" });
+		attach(Params3[i]);
+		Params3[i].put(directory_path[i]);	// Idem qu'au dessus
+		titles_params3.push_back(new Graph_lib::Out_static_box{ Point{ coord_x[2] + 220, coord_y[2] + 20 + i * 20 },250, 20, directory_name[i],nullopt, nullopt, nullopt, nullopt, nullopt, nullopt });
+		attach(titles_params3[i]);
+
+	}
+
+	// Apparition des autres éléments graphiques ------------------------------------------
+	attach(save_button);
+
+}
+
+void Params::cb_save(Address, Address pw)			// "the usual"
+{
+	reference_to<Params>(pw).save();
+}
+
+void Params::save()
+{
+	// Ouverture de la base de données en écriture
+	auto in = open_db_write("QIF2_params.db3");
+	
+	// On supprime la table des Opérations Cumulées (OC)
+	in.exec("DROP TABLE IF EXISTS CumulOps");
+	in.exec("CREATE TABLE CumulOps (value TEXT)");
+	
+	// On déconcatène la chaîne du bloc multilignes
+	vector<string>Params1 = split_string(Params1_ML.get_string(), '\n');
+
+	// On recrée la table des OC
+	size_t nb_OC = Params1.size();
+
+	for (int i = 0; i < nb_OC; ++i) {
+		string value = Params1[i];
+		if (!value.empty()) {
+			SQLite::Statement query(in, "INSERT INTO CumulOps VALUES (?)");
+			query.bind(1, value);
+			int nb = query.exec();
+
+		}
+	}
+	
+	// Table des clés des sites Web
+	in.exec("DROP TABLE IF EXISTS WebsiteKey");
+	in.exec("CREATE TABLE WebsiteKey (id INTEGER PRIMARY KEY, apikey TEXT, siteweb TEXT)");
+
+	for (int i = 0; i < Params2.size(); ++i) {
+		string value = Params2[i].get_string();
+		
+		// La clé ne peut pas avoir de valeur nulle...
+		if (value.empty()) value = website_key[i];	// ... Si c'est le cas, on récupère la valeur précédemment chargée
+		
+		SQLite::Statement query(in, "INSERT INTO WebsiteKey VALUES (?,?,?)");
+		query.bind(1, i + 1);						// bind du 1er param	: la clé qui débute à 1
+		query.bind(2, value);						// bind du 2ème param	: la clé du site
+		query.bind(3, titles_params2[i].label);		// bind du 3ème param	: le nom du site
+		int nb = query.exec();
+		
+	}
+	 
+
+	// Table des répertoires
+	in.exec("DROP TABLE IF EXISTS Directory");
+	in.exec("CREATE TABLE Directory (id INTEGER PRIMARY KEY, dir_path TEXT, dir_name TEXT)");
+
+	for (int i = 0; i < Params3.size(); ++i) {
+		string value = Params3[i].get_string();
+
+		// La clé ne peut pas avoir de valeur nulle...
+		if (value.empty()) value = directory_path[i];	// ... Si c'est le cas, on récupère la valeur précédemment chargée
+
+		SQLite::Statement query(in, "INSERT INTO Directory VALUES (?,?,?)");
+		query.bind(1, i + 1);							// bind du 1er param	: la clé qui débute à 1
+		query.bind(2, value);							// bind du 2ème param	: le chemin et le fichier
+		query.bind(3, titles_params3[i].label);			// bind du 3ème param	: le nom du répertoire
+		int nb = query.exec();
+
+	}
+
+	// On ferme la fenêtre des paramètres
+	detach(save_button);
+	hide();
+
+}
+
+ 
+// ---------------------------------------------------------------------------------------------------------------------------------- fenêtre principale de l'application
+struct Dashboard : Window {
+			
+	Dashboard(Point xy, int w, int h, const string& title);
+	   
+	~Dashboard()	
+	{
+
+	}
+
+	void display_msg(string s) { message.put(s); }
+	
+	// Données
+	QIF_file qfile;									// Structure principale de données : compte et ops
+	vector <wstring> account_displayed{};			// Comptes effectivement affichés
+	vector <TA_results> TA_results_shared{};		// Partage des lignes du tableau d'amortissement entre la fenêtre principale (Dashboard) et la secondaire (TA)
+	vector <TOP50_results> TOP50_results_shared{};	// Partage des lignes du TOP50 des dépenses entre la fenêtre principale (Dashboard) et la secondaire (TOP50)
+
+	// --------------------------------------------------------
+
+
+private:
+	Button quit_button, pwd_button, retpro_button, amort_button, tab_amort_button, search_button, majStocks_button, params_button, test_button, TOP50_button;
+	Out_static_box FLTK_releases, acc_list_title, ops_list_title, search_ops_help;
+	Out_box message;
+	In_box_double capital, retrait_mensuel, tx_interet, emprunt, tx_annuel, tx_assurance;	// Utilisation de In_box_double pour une gestion affinée du point décimal
+	In_box search_ops, search_ops_year, duree, annee1_TOP50, annee2_TOP50;
+	dropdown_list account_list, operations_list, cumul_ops_list;
+	Vector_ref <Graph_lib::Line>trait{};
+	Vector_ref <Graph_lib::Out_static_box>simulation, titles, columns_l, columns_c, totaux, labels_sim, labels_sim2, labels_sim3,retpro_result, amort_result {};
+																
+	// actions invoked by callbacks
+	void quit(), pwd(), retpro(), amort(), tab_amort(), maj(), search(), account_ops(), params(), test(), TOP50_depenses();
+	
+	// callbacks functions
+	static void cb_quit(Address, Address), cb_pwd(Address, Address), cb_retpro(Address, Address), cb_amort(Address, Address), cb_tab_amort(Address, Address), cb_search(Address, Address), 
+		cb_maj(Address, Address), cb_account_ops(Address, Address), cb_params(Address, Address), cb_test(Address, Address), cb_TOP50_depenses(Address, Address);
+	
+};
+
+//------------------------------------------------------------------------------
+
+Dashboard::Dashboard(Point xy, int w, int h, const string& title)			// Constructeur - Amélioration : coordonnées relatives des widgets et non absolues
+	:Window(xy, w, h, title),
+	quit_button(Point(x_max() - 70, 0), 70, 20, "Quitter", cb_quit),
+	params_button(Point(x_max() - 70, 25), 70, 20, "Params", cb_params),
+	test_button(Point(x_max() - 70, 50), 70, 20, "Test", cb_test),
+	pwd_button(Point(x_max() - 200, 0), 70, 20, "Entrer", cb_pwd),
+	capital(Point(408, y_max() - 140), 72, 20, ""),
+	retrait_mensuel(Point(715, y_max() - 140), 65, 20, ""),
+	tx_interet(Point(1035, y_max() - 140), 45, 20, ""),
+	retpro_button(Point(1180, y_max() - 140), 70, 20, "Calculer", cb_retpro),
+	emprunt(Point(408, y_max() - 85), 72, 20, ""),
+	duree(Point(630, y_max() - 85), 40, 20, ""),
+	tx_annuel(Point(840, y_max() - 85), 40, 20, ""),
+	tx_assurance(Point(1040, y_max() - 85), 40, 20, ""),
+	amort_button(Point(1180, y_max() - 85), 70, 20, "Calculer", cb_amort),
+	tab_amort_button(Point(1260, y_max() - 85), 30, 20, "TA", cb_tab_amort),
+	annee1_TOP50(Point(480, y_max() - 35), 40, 20, ""),
+	annee2_TOP50(Point(565, y_max() - 35), 40, 20, ""),
+	TOP50_button(Point(630, y_max() - 35), 30, 20, "GO", cb_TOP50_depenses),
+	message(Point(x_max() - 1000, y_max() - 35), 450, 20, ""),
+	majStocks_button(Point(x_max() - 530, y_max() - 35), 100, 20, "MAJ Actions", cb_maj),
+	FLTK_releases(Point(x_max() - 400, y_max() - 75), 1000, 400, display_FLTK_versions(x_max(), y_max()), nullopt, 10, nullopt, nullopt, nullopt, nullopt),
+	// Grand écran pour les éléments graphiques suivants
+	acc_list_title(Point(x_max() - 1000, y_max() - 700), 250, 30, "Choisir un compte ou rechercher", Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt),
+	ops_list_title(Point(x_max() - 700, y_max() - 700), 400, 30, "Liste des opérations (ordre chronologique inverse)", Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt),
+	account_list(Point(x_max() - 1000, y_max() - 670), 280, 560, "", cb_account_ops),
+	search_ops(Point(x_max() - 1000, y_max() - 100), 190, 20, ""),
+	search_ops_year(Point(x_max() - 805, y_max() - 100), 45, 20, ""),
+	search_ops_help(Point(x_max() - 1000, y_max() - 75), 150, 10, "Ex : <-5000, >10000, Liquide...", nullopt, 10, nullopt, nullopt, nullopt, nullopt),
+	operations_list(Point(x_max() - 700, y_max() - 670), 650, 590, "", 0),	// Pas de CallBack sur cette liste déroulante
+	cumul_ops_list(Point(10, y_max() - 670), 1260, 420, "", 0),				// Pas de CallBack sur cette liste déroulante
+	search_button(Point(x_max() - 750, y_max() - 100), 30, 20, "GO", cb_search)
+
+{
+	// Apparition des éléments graphiques
+	attach(quit_button);
+	attach(pwd_button);
+				
+}
+
+
+//------------------------------------------------------------------------------
+
+void Dashboard::cb_quit(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).quit();
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::cb_pwd(Address, Address pw)				// "the usual"
+{
+	reference_to<Dashboard>(pw).pwd();
+}
+
+void Dashboard::cb_params(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).params();
+}
+
+void Dashboard::cb_test(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).test();
+}
+
+void Dashboard::cb_retpro(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).retpro();
+}
+
+void Dashboard::cb_amort(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).amort();
+}
+
+void Dashboard::cb_tab_amort(Address, Address pw)		// "the usual"
+{
+	reference_to<Dashboard>(pw).tab_amort();
+}
+
+void Dashboard::cb_TOP50_depenses(Address, Address pw)		// "the usual"
+{
+	reference_to<Dashboard>(pw).TOP50_depenses();
+}
+
+void Dashboard::cb_search(Address, Address pw)			// "the usual"
+{
+	reference_to<Dashboard>(pw).search();
+}
+
+void Dashboard::cb_maj(Address, Address pw)				// "the usual"
+{
+	reference_to<Dashboard>(pw).maj();
+}
+
+void Dashboard::cb_account_ops(Address, Address pw)		// "the usual"
+{
+	reference_to<Dashboard>(pw).account_ops();
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::quit()
+{
+	
+	// A priori inutile si hide() détruit bien les widgets attachés à la fenêtre
+	detach(quit_button);
+	detach(pwd_button);
+	
+	hide();			// curious FLTK idiom for delete window
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::params()
+{
+
+	// Gestion des paramètres de l'application
+	Params myParams(Point(50, 50), 1000, 650, "Paramètres de l'application");
+	gui_main();	// Control inversion page 569 de PPP2
+}
+
+void Dashboard::TOP50_depenses() 
+{
+
+	// Guards
+	auto [day, month, year] = date_now();
+	int year_low = 2010;	// Aucune opération plus ancienne que cette année dans le fichier QIF de Banktivity
+	int year_high = year;
+
+	int year1 = annee1_TOP50.get_int();
+	int year2 = annee2_TOP50.get_int();
+
+	if (year2 > year_high) { year2 = year_high; annee2_TOP50.put(to_string(year2)); }
+
+	if (year1 > year2) {year1 = year2; annee1_TOP50.put(to_string(year1)); }		
+	if (year1 < year_low) { year1 = year_low; annee1_TOP50.put(to_string(year1)); }
+	if (year2 < year1) {year2 = year1; annee2_TOP50.put(to_string(year2));}
+	
+	// Sélection des opérations de débit en fonction de l'ancienneté souhaitée
+	vector<Operation>op_debit{};
+	std::copy_if(qfile.op.begin(), qfile.op.end(), std::back_inserter(op_debit), [=](const Operation& a) 
+		{ return a.montant < 0 && stoi(a.date.substr(6, 4)) >= year1 && stoi(a.date.substr(6, 4)) <= year2 ; });
+		
+	// Suppression des opérations pouvant "polluant" le top 10. Ex : Placement, Renflouement, Cr pour Crédit, etc.
+	op_debit.erase(std::remove_if(op_debit.begin(), op_debit.end(), [](const Operation& a) 
+		{ return !a.libelle.find(L"Renflouement") || !a.libelle.find(L"Placement") || !a.libelle.find(L"Cr") || !a.libelle.find(L"Solde") || !a.libelle.find(L"Acompte")
+		|| !a.libelle.find(L"STARTING BALANCE") || !a.libelle.find(L"Vente") || !a.libelle.find(L"Apport") || !a.libelle.find(L"Acquisition") || !a.libelle.find(L"Rachat")
+		|| !a.libelle.find(L"Remboursement partiel") || !a.libelle.find(L"Remboursement total") || !a.libelle.find(L"Appel de fonds") || !a.libelle.find(L"Ajustement")
+		|| !a.libelle.find(L"Alimentation CE pour") || !a.libelle.find(L"Caisse d'Epargne") || !a.libelle.find(L"Avance") || !a.libelle.find(L"Moins-VALUE")
+		|| !a.libelle.find(L"Carte bleue") || !a.libelle.find(L"Carte Amex") || !a.libelle.find(L"Carte amex") || !a.libelle.find(L"AWS") || !a.libelle.find(L"Frais de dossier")
+		|| !a.libelle.find(L"BNP Paribas") || !a.libelle.find(L"Hello Bank") || !a.libelle.find(L"LCL") || !a.libelle.find(L"IRPP")
+		; }) , op_debit.end());
+	
+	// Tri
+	std::sort(op_debit.begin(), op_debit.end(), [](const Operation& a, const Operation& b) { return a.libelle < b.libelle; });
+
+	// Alimentation du vecteur final à afficher comportant les cumuls
+	TOP50_results_shared.clear();				// Initialisation du vecteur avant chaque nouveau calcul
+		
+	auto p = op_debit.begin();
+	for (; p != op_debit.end(); ++p) {
+		double cumul = 0.0;
+		wstring op_encours = (*p).libelle;
+		
+		while ((*p).libelle == op_encours) { 
+			cumul += (*p).montant; 
+			if (p != op_debit.end()) ++p;		// Guard si l'on arrive à la fin du vecteur : plus aucune valeur ensuite.
+		}
+
+		--p;
+		TOP50_results_shared.push_back(TOP50_results{ op_encours,cumul });
+			
+	} 
+
+	// Test de l'alimentation du vecteur final via les algorithmes de la STL
+	/* 
+	auto op_debit1 = multimap<wstring, double>{};
+	for (auto x : op_debit) { op_debit1.insert(make_pair(x.libelle, x.montant)); }
+	for (auto x : op_debit1) { wcout <<x.first<< "  "<<x.second<<endl; }
+	
+	for (auto it = op_debit1.begin(), end = op_debit1.end(); it != end; it = op_debit1.upper_bound(it->first))
+	{
+		auto ppp = op_debit1.equal_range(it->);
+		double cumul1 = std::accumulate(op_debit1.begin(), op_debit1.end(), 0, [](double lhs, const std::multimap<wstring, double>::value_type& p) { return lhs + p.second; });
+		
+		cout << cumul1 << endl;
+
+	}
+	*/
+
+	// **************************************************************************************************
+
+	// Tri 
+	std::sort(TOP50_results_shared.begin(), TOP50_results_shared.end(), [](const TOP50_results& a, const TOP50_results& b) { return a.cumul < b.cumul; });
+
+	// Affichage du TOP50 des dépenses : on passe les lignes du TOP50 pré-calculées à la nouvelle fenêtre (Dependecy Injection)
+	TOP50 myTOP50(Point(1000, 85), 700, 850, "TOP50 des dépenses récurrentes (hors IRPP, gros travaux ou achats immobiliers)", TOP50_results_shared, year2-year1+1);	
+	gui_main();	// Control inversion page 569 de PPP2
+	
+}
+
+void Dashboard::test()
+{
+
+	// Test de nouvelles fonctionnalités avant incorporation éventuelle dans le corps de l'application
+	Test myTests(Point(50, 50), 1000, 650, "Test de nouvelles fonctionnalités");
+	gui_main();	// Control inversion page 569 de PPP2
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::retpro()
+{
+
+	// Si un précédent calcul est affiché, on l'efface
+	if (retpro_result.size() > 0) {
+		detach(retpro_result[0]);
+		retpro_result.erase();
+
+	}
+
+	const double c = capital.get_double();
+	const double r = retrait_mensuel.get_double();
+	double t = tx_interet.get_double();
+
+	if (t < 0) { t = 0; tx_interet.put(0);}	// Si le champ "taux" est vide, on l'initialise à 0
+
+	auto [nbMois, gainTotalInterets] = retraits_programmes(c, r, t);
+
+	if (nbMois == 0.0) {	// Un problème a été constaté et une box d'alerte a été affichée
+		capital.put(0);
+		retrait_mensuel.put(0);
+		tx_interet.put(0);
+		
+	}
+	else {									// Affichage du résultat du calcul
+		string ret_pro = "Le capital sera épuisé après " + to_string(nbMois) + " mois (soit " + d2s(nbMois / 12.0, 2) +
+			" ans). Le gain total en intérêts servis par l'assureur sur cette durée se monte à " + d2s(gainTotalInterets, 0) + " euros.";
+
+		retpro_result.push_back(new Graph_lib::Out_static_box{ Point{ 330, y_max() - 115 },500, 30, ret_pro, Font::helvetica_italic, nullopt, nullopt, nullopt, nullopt, nullopt });
+		attach(retpro_result[0]);
+	}
+		
+	redraw();
+
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::amort()
+{
+
+	// Si un précédent calcul est affiché, on l'efface
+	if (amort_result.size() > 0) {
+		detach(amort_result[0]);
+		amort_result.erase();
+
+	}
+
+	const double e = emprunt.get_double();
+	const int r = duree.get_int();
+	double t1 = tx_annuel.get_double();
+	double t2 = tx_assurance.get_double();
+	TA_results_shared.clear();						// Initialisation du vecteur avant chaque nouveau calcul
+	 	
+	if (t2 < 0) { t2 = 0; tx_assurance.put(0); }	// Si le champ "taux" est vide, on l'initialise à 0
+
+	auto [mensualiteHA, coutAssurance, TX] = amortissement(e, r, t1, t2);
+	
+	TA_results_shared = TX;		// On passe par cette affectation car 'auto [mensualiteHA, coutAssurance, TA_results_shared]' ne prend qu'une copie locale de TA_results_shared et pas l'entité de la 'struct'
+
+	if (mensualiteHA == 0.0) {	// Un problème a été constaté et une box d'alerte a été affichée
+		emprunt.put(0);
+		duree.put(0);
+		tx_annuel.put(0);
+		tx_assurance.put(0);
+
+	}
+	else {										// Affichage du résultat du calcul
+		string amort = "La mensualité se monte à " + d2s(mensualiteHA, 2) + " euros";
+		if (coutAssurance > 0) amort = "La mensualité se monte à " + d2s(mensualiteHA + coutAssurance, 2) +" euros, assurance comprise";
+
+		amort_result.push_back(new Graph_lib::Out_static_box{ Point{ 330, y_max() - 60 },500, 30, amort, Font::helvetica_italic, nullopt, nullopt, nullopt, nullopt, nullopt });
+		attach(amort_result[0]);
+	}
+
+	redraw();
+	
+}
+//------------------------------------------------------------------------------
+
+void Dashboard::tab_amort()
+{
+
+	// Gestion des paramètres de l'application
+	TA myTA(Point(1000, 85), 700, 850, "Tableau d'amortissement", TA_results_shared);	// On passe les lignes du tableau d'amortissement pré-calculées à la nouvelle fenêtre (Dependecy Injection)
+	gui_main();	// Control inversion page 569 de PPP2
+
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::maj()
+{
+	
+	// Rechargement du taux de change
+	fs::path json_file_to_open = "currency.json";
+	build_json_file(CURRENCY_FILE, json_file_to_open.string());
+
+	// Rechargement des valeurs des actions en portefeuille
+	for (auto& p : qfile.stocks) {
+		json_file_to_open = p.first + ".json";
+		build_json_file(STOCKS_FILE, json_file_to_open.string());							
+		
+	}
+
+	display_msg("Mise à jour effective au prochain lancement de l'application");
+
+}
+
+void Dashboard::search()
+{
+	const int EGAL = 0;
+	const int SUP = 1;
+	const int INF = 2;
+
+	// on efface la liste déroulante contenant d'éventuelles opérations
+	operations_list.clear();								
+		
+	// On récupère le contenu du champ de saisie de la recherche, qui doit être non nul - Les accents sont acceptés
+	const string ss = search_ops.get_string();				
+	if (ss.empty()) return;
+
+	// On récupère le contenu du champ de saisie de l'année de recherche, qui peut être vide
+	const string search_year = search_ops_year.get_string();
+		
+	// Opérateur présent ? < ou >
+	wstring search = s2ws(ss);
+	const string sso = ss.substr(0,1);
+	int operateur{};
+	int debut = 1;
+	size_t fin = search.size() - 1;
+	if (sso == ">") {
+		operateur = SUP;
+		
+	}
+	else if (sso == "<") {
+		operateur = INF;
+		
+	}
+	else {
+		operateur = EGAL;
+		debut = 0;
+		fin = search.size();
+	}
+		   
+	// La transformation d'une wstring en double n'est pas triviale ; wcstod est complexe à manipuler donc on passe par wstringstream
+	wstringstream ss1{ search.substr(debut, fin) };
+	double montant = 0.0;
+	ss1 >> montant;
+
+	vector<Operation> op_to_display{};
+
+	for (auto x: qfile.op) {
+		// Cas 1 : la comparaison s'effectue sur le montant de l'opération (+ éventuellement l'année de recherche saisie)
+		if (montant != 0) {
+			int op_to_store = 0;
+			switch (operateur)
+			{
+				case SUP:
+				{
+					if (x.montant > montant) op_to_store = 1;
+					break;
+				}
+
+				case INF:
+				{
+					if (x.montant < montant) op_to_store = 1;
+					break;
+				}
+
+				case EGAL:
+				{
+					if (x.montant == montant) op_to_store = 1;
+					break;
+				}
+			}
+
+			if (op_to_store && selected_year(search_year, x.date)) op_to_display.push_back(Operation{ x.date,x.montant,x.libelle,x.account_name });
+		
+		} else {
+			// Cas 2 : la comparaison s'effectue sur le libellé de l'opération qui peut contenir la chaîne recherchée (+ éventuellement l'année de recherche saisie)
+			string::size_type n = x.libelle.find(search);
+			if (n != string::npos && selected_year(search_year,x.date)) op_to_display.push_back(Operation{ x.date,x.montant,x.libelle,x.account_name });
+				
+		}
+	
+	}
+	
+	// On récupère un vecteur d'opérations formatées pour l'affichage (compte non sélectionné = false)
+	auto[list_ops, montant_total] = format_list_ops(op_to_display, false);
+		
+	// Affichage chronologique inverse des opérations post-tri (sur la sous-chaîne date située au début de l'opération)
+	sort(list_ops.begin(), list_ops.end(), [](const string& a, const string& b) 
+		{return a.substr(6,4) + a.substr(3, 2) + a.substr(0, 2) < b.substr(6, 4) + b.substr(3, 2) + b.substr(0, 2); });
+	for (vector<string>::reverse_iterator i = list_ops.rbegin(); i != list_ops.rend(); ++i) {
+		operations_list.put(*i);
+	}
+
+	string msg{};
+	if (list_ops.size() != 0)
+		msg = to_string(list_ops.size()) + " opérations trouvées pour un montant total de "+ d2s(abs(montant_total),2)+ " euros";
+
+	else
+		msg = "Aucune opération ne correspond à cette recherche !";
+
+	display_msg(msg);
+	
+}
+
+void Dashboard::account_ops()
+{
+
+	operations_list.clear();											// on efface la liste déroulante contenant d'éventuelles opérations
+	
+	wstring name = account_displayed[account_list.get_value() - 1];		// On détermine le compte sélectionné via le numéro de la ligne choisie 
+	
+	//sort(qfile.op.begin(), qfile.op.end(), [](const Operation& a, const Operation& b) {return a.account_name < b.account_name; });
+	auto ops_checked = find_if(qfile.op.begin(), qfile.op.end(), [&name](const Operation& a) {return a.account_name == name; });
+	
+	vector<Operation> op_to_display{};
+	while (ops_checked != qfile.op.end() && ops_checked->account_name == name) {
+		op_to_display.push_back(Operation{ ops_checked->date,ops_checked->montant,ops_checked->libelle,ops_checked->account_name });
+		++ops_checked;
+	}
+
+	// On récupère un vecteur d'opérations formatées pour l'affichage (compte sélectionné = true)
+	auto[list_ops, montant_total] = format_list_ops(op_to_display, true);
+	
+	// Affichage chronologique inverse des opérations
+	for (vector<string>::reverse_iterator i = list_ops.rbegin(); i != list_ops.rend(); ++i) {
+		operations_list.put(*i);
+	}
+
+	display_msg("Le compte sélectionné comporte " + to_string(list_ops.size()) + " opérations");
+	
+}
+
+//------------------------------------------------------------------------------
+
+void Dashboard::pwd()
+{
+	const char *input_pwd = fl_password("Saisir le Mot de Passe :");	
+	attach(message);
+
+	if (input_pwd == NULL)	// Appui sur CANCEL
+		exit(1);
+		
+	//if (strcmp(input_pwd, PASSWORD) != 0)	// Ancien test quand le password était "en clair" dans le source
+		// My_error("Mauvais mot de passe !");
+	//	display_msg("Mauvais mot de passe !");
+	
+	clock_t t0 = clock();	// On démarre le chronométrage du temps nécessaire pour décrypter et afficher les données
+	
+	if (crypto_pwhash_str_verify (HASHED_PASSWORD, input_pwd, strlen(input_pwd)) != 0) {
+		display_msg("Mauvais mot de passe !");
+
+	}
+	
+	else
+	{
+		detach(pwd_button);
+		bool wide_screen = x_max() > 1920 ? true: false;
+		
+		// Apparition des éléments graphiques communs à tout type d'écran
+		attach(params_button);
+		attach(majStocks_button);
+		attach(FLTK_releases);
+		attach(test_button);
+		attach(capital);
+		attach(retrait_mensuel);
+		attach(tx_interet);
+		attach(retpro_button);
+		attach(emprunt);
+		attach(duree);
+		attach(tx_annuel);
+		attach(tx_assurance);
+		attach(amort_button);
+		attach(tab_amort_button);
+		attach(annee1_TOP50);
+		attach(annee2_TOP50);
+		attach(TOP50_button);
+		attach(cumul_ops_list);
+
+		if (wide_screen) {	// Eléments graphiques supplémentaires au dessus de 1 920 pixels de large	
+			attach(search_button);
+			attach(acc_list_title);
+			attach(ops_list_title);
+			attach(account_list);
+			attach(search_ops);
+			attach(search_ops_year);
+			attach(search_ops_help);
+			attach(operations_list);
+
+		}
+		
+		// On récupère la date du jour et on affiche l'année dans la zone de recherche complémentaire ainsi que dans les champs "TOP50"
+		auto[day, month, year] = date_now();
+		annee1_TOP50.put(to_string(year));
+		annee2_TOP50.put(to_string(year));
+
+		auto[QIF_file_to_open, file_date] = file_to_decrypt(input_pwd);	// On recherche dans le répertoire courant le fichier de données chiffrées et sa date de création
+						
+		qfile = QIF_file_to_open;										// Création de l'objet de type QIF_file en partant du fichier encodé en UTF-8 par Banktivity
+		qfile.creation_date = file_date;
+
+		fs::remove(QIF_file_to_open);									// Destruction du fichier .qif lisible sur le disque dur, maintenant que les données sont en mémoire 
+		
+		
+		// En-tête
+		static const int nb_colonnes = 6;
+		static char titles_labels[nb_colonnes][40]{ "Comptes courants","RESET","Epargne disponible","Fonds Retraite (rentes viagères)", "Assets" ,"Dettes" };
+
+		// Affichage du tableau de synthèse des comptes : utilisation de multimap plutôt que des vecteurs spécifiques par colonne
+		multimap<int, Printing_account> colonne{};		// La clé 'int' correspond à l'une des 6 colonnes possibles et peut être dupliquée
+		vector<int>nb_lignes_print(nb_colonnes);
+
+		sort(qfile.ac.begin(), qfile.ac.end(), [](const Account& a, const Account& b) {return abs(a.balance) > abs(b.balance); });
+		for (auto x : qfile.ac) {
+			if (x.balance != 0) {	// On n'imprime que les comptes dont le solde est différent de 0
+				if (x.name.substr(0, 2) == L"(C") {
+					colonne.insert(make_pair(0, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[0];
+				}
+				else if (x.name.substr(0, 3) == L"[R]") {
+					colonne.insert(make_pair(1, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[1];
+				}
+				else if (x.name.substr(0, 3) == L"[e]") {
+					colonne.insert(make_pair(2, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[2];
+				}
+				else if (x.name.substr(0, 1) == L"z") {
+					colonne.insert(make_pair(3, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[3];
+				}
+				else if (x.type == Account::Category::OthA) {
+					colonne.insert(make_pair(4, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[4];
+				}
+				else if (x.balance < 0) {
+					colonne.insert(make_pair(5, Printing_account{ x.name,x.balance }));
+					++nb_lignes_print[5];
+				}
+				else
+					My_error("Erreur : catégorie de compte inconnue [QIF2] !");
+
+			}
+		}
+
+		// Marges 
+		const int MARGE_X = 10;		// A partir du haut
+		const int MARGE_Y = 10;
+		// const int MARGE_OP = 100;	// Entre la synthèse des comptes et le bloc d'opérations cumulées : fonctionne mal sous OS X et Linux (espacement de polices)
+
+		// Impression du tableau : 2 jeux de colonnes (labels et nombres) pour des problèmes d'alignement gauche/droite
+		vector<string>ligne_l(nb_colonnes), ligne_c(nb_colonnes), totaux_c(nb_colonnes);	// Concaténation des comptes de chaque colonne (comptes courants, RESET, etc.)
+
+		// Compteur pour afficher la position des totaux
+		std::vector<int>::iterator result = max_element(nb_lignes_print.begin(), nb_lignes_print.end());
+		int nb_lignes_max = nb_lignes_print[distance(nb_lignes_print.begin(), result)];
+
+		for (int col = 0; col < nb_colonnes; ++col) {
+			auto range = colonne.equal_range(col);					// Contenu de la colonne : labels et nombres		
+			double total = 0.0;
+
+			for (auto t = range.first; t != range.second; ++t) {
+				// Traitement du label
+				string account_label = ws2s(t->second.name);		// Transformation d'un wstring en string via une fonction helper
+				ligne_l[col] += account_label + '\n';
+
+				// Traitement du nombre
+				total += t->second.balance;
+				ligne_c[col] += d2s(t->second.balance, 2) + '\n';	// On génère une chaîne avec 2 décimales										
+
+			}
+			// Traitement du total de la colonne
+			totaux_c[col] = d2s(total, 2);
+
+			// Création des 4 champs pour la colonne en cours : 350 et 300
+			titles.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 300 * col, MARGE_Y },290, 30,titles_labels[col],Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt,nullopt });
+			columns_l.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 300 * col, MARGE_Y + 30 },290, 300,ligne_l[col],nullopt, nullopt, nullopt, nullopt, nullopt, nullopt });
+			columns_c.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 300 * col, MARGE_Y + 30 },290, 300,ligne_c[col],nullopt, nullopt, nullopt, Align::right, nullopt, nullopt });
+			totaux.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 300 * col, MARGE_Y + nb_lignes_max * 20 },290, 30,totaux_c[col], Font::courier_bold, nullopt,nullopt,Align::right,nullopt, nullopt });
+
+			attach(titles[col]);
+			attach(columns_l[col]);
+			attach(columns_c[col]);
+			attach(totaux[col]);
+
+		}
+
+		// Affichage de la richesse totale, repositionnée à droite de l'écran + autres labels
+		// On utilise le 'vector_ref' simulation pour stocker tous les labels et valeurs à afficher
+		simulation.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 300 * nb_colonnes, MARGE_Y + nb_lignes_max * 20 },320, 30, "  [" + d2s(qfile.wealth, 0) + " E]",
+			nullopt, nullopt, nullopt, nullopt, nullopt, nullopt });
+		simulation.push_back(new Graph_lib::Out_static_box{ Point(MARGE_X, y_max() - 700),320, 20, "Opérations cumulées pour les années :",
+			Font::helvetica_bold, 14, Color::dark_magenta, nullopt, nullopt, nullopt });
+
+		// Création du tableau des opérations cumulées paramétrées
+		auto in = open_db_read("QIF2_params.db3");
+		vector<wstring>CumulOps{};
+		SQLite::Statement query(in, "SELECT * FROM CumulOps");
+
+		// La table entière est 'balayée'
+		while (query.executeStep()) {
+			string label = query.getColumn(0);
+			CumulOps.push_back(s2ws(label));
+
+		}
+
+		// Recherche et stockage des opérations 
+		multimap<wstring, Operation> CumulOps_found{};
+
+		for (auto x : qfile.op) {
+			for (auto y : CumulOps) {
+				string::size_type n = x.libelle.find(y);
+				if (n != string::npos) CumulOps_found.insert(make_pair(y, Operation{ x.date,x.montant,x.libelle,x.account_name }));
+
+			}
+
+		}
+
+		vector <double> total_per_year(NB_COLS_CUMULOPS);	// Vecteur contenant les 11 totaux généraux (initialisés à 0)
+		vector <double> sous_totaux(NB_COLS_CUMULOPS);
+
+		// Cumul des opérations sur l'année
+		for (unsigned int x = 0; x < CumulOps.size(); ++x) {
+
+			auto range = CumulOps_found.equal_range(CumulOps[x]);
+			vector <double> totaux{};
+
+			for (int year_ops = year; year_ops > year - NB_COLS_CUMULOPS; --year_ops) {
+
+				double total = 0.0;
+
+				for (auto t = range.first; t != range.second; ++t) {
+
+
+					if (to_string(year_ops) == t->second.date.substr(6, 4)) {
+						total += t->second.montant;
+
+						// Cas particulier d'une opération cumulée relative à un crédit (Banktivity crée en effet une contrepartie positive au débit, ce qui annule de fait l'opération)
+						if (ws2s(CumulOps[x].substr(0, 6)) == "Crédit" && t->second.montant > 0)
+							total -= t->second.montant;		// On annule l'opération précédente
+
+					}
+
+				}
+
+				totaux.push_back(total);					// Le vecteur contiendra tous les totaux par année pour l'opération en cours
+				total_per_year[year - year_ops] += total;	// On additionne le total au total général de l'année 
+
+			}
+
+			// On récupère une ligne complète pour affichage : nom opération + totaux par année
+			cumul_ops_list.put(ws2s(format_list_cumul_ops(CumulOps[x], totaux, sous_totaux)));
+
+		}
+
+		// Labels "Années" (haut du tableau) et totaux généraux par année (bas du tableau)
+		for (int year_ops = year; year_ops > year - NB_COLS_CUMULOPS; --year_ops) {
+			simulation.push_back(new Graph_lib::Out_static_box{ Point(MARGE_X + 350 + 84 * (year - year_ops), y_max() - 700),30, 20,to_string(year_ops),Font::helvetica_bold, 14,
+				Color::dark_magenta, nullopt, nullopt, nullopt });
+
+			simulation.push_back(new Graph_lib::Out_static_box{ Point(MARGE_X + 360 + 84 * (year - year_ops), y_max() - 235),30, 17,d2s(total_per_year[year - year_ops],2), 
+				Font::courier_bold, nullopt, nullopt, Align::right, nullopt, nullopt }); // Total général de l'année
+
+		}
+
+		// Affichage des labels et des 3 zones de saisie des valeurs de la simulation "retraits programmés"
+		simulation.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X , y_max() - 140 },320, 20, "Retraits programmés :", Font::helvetica_bold, 14, Color::dark_magenta,
+			nullopt, nullopt, nullopt });
+		static char labels_titles[6][40]{ "Capital :","euros","Montant :","euros/mois", "Tx intérêt :" ,"%/an" };
+		for (int col = 0; col < 6; ++col) {
+			labels_sim.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 320 + 150 * col, y_max() - 140 },320, 30,labels_titles[col],nullopt, 14, nullopt, nullopt, nullopt, nullopt });
+			attach(labels_sim[col]);
+
+		}
+
+		// Affichage des labels et des 4 zones de saisie des valeurs de la simulation "amortissement"
+		simulation.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X , y_max() - 85 },320, 20, "Amortissement :", Font::helvetica_bold, 14, Color::dark_magenta,
+			nullopt, nullopt, nullopt });
+		static char labels_titles2[8][40]{ "Emprunt :","euros","Durée :","mois", "Tx int. :" ,"%/an", "Tx assu. :" ,"%/an" };
+		static int labels_position[8]{ 0,150,240,340,430,550,615,750 };
+		for (int col = 0; col < 8; ++col) {
+			labels_sim2.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 320 + labels_position[col], y_max() - 85 },320, 30,labels_titles2[col],nullopt, 14, nullopt, nullopt, nullopt, nullopt });
+			attach(labels_sim2[col]);
+
+		}
+
+		// Affichage des labels et de la zone de saisie de la valeur de la simulation "TOP 50 des dépenses"
+		simulation.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X , y_max() - 30 },320, 20, "TOP 50 des dépenses :", Font::helvetica_bold, 14, Color::dark_magenta,
+			nullopt, nullopt, nullopt });
+		static char labels_titles3[2][40]{ "Entre les années","et" };
+		for (int col = 0; col < 2; ++col) {
+			labels_sim3.push_back(new Graph_lib::Out_static_box{ Point{ MARGE_X + 320 + 200 * col, y_max() - 30 },320, 30,labels_titles3[col],nullopt, 14, nullopt, nullopt, nullopt, nullopt });
+			attach(labels_sim3[col]);
+
+		}
+
+		// Affichage des différents labels créés
+		for (int x = 0; x < simulation.size(); ++x)
+			attach(simulation[x]);
+
+		
+		// Eléments graphiques supplémentaires au dessus de 1 920 pixels de large *********************************************************************************************
+		if (wide_screen) {		
+			search_ops_year.put(to_string(year));
+
+			// Affichage de la liste des comptes
+			for (int col = 0; col < nb_colonnes; ++col) {
+				auto range = colonne.equal_range(col);					// Contenu de la colonne : labels et nombres		
+
+				for (auto t = range.first; t != range.second; ++t) {
+					// Traitement du label
+					account_displayed.push_back(t->second.name);		// On popule les comptes effectivement affichés (= sert dans la gestion de l'affichage des opérations)
+					string account_label = ws2s(t->second.name);		// Transformation d'un wstring en string via une fonction helper
+					account_list.put(account_label);					// On popule la liste déroulante des comptes
+
+				}
+
+			}
+
+			// Affichage des traits de séparation
+			trait.push_back(new Graph_lib::Line{ Point{ x_max() - 1040, y_max() - 700 }, Point{ x_max() - 1040, y_max() - 15 } });
+			for (int x = 0; x < trait.size(); ++x)
+				attach(trait[x]);
+
+		} // Fin du bloc dédié aux écrans possédant plus de 1 920 pixels de large ***********************************************************************************************
+		
+		clock_t t1 = clock();
+				
+		// On "caste" t1 et t0 pour éviter le warning C26451
+		display_msg("Fichier de données ouvert en " + d2s(((double)t1 - (double)t0) * 1000 / CLOCKS_PER_SEC, 0) + " ms [" + qfile.creation_date + "]");
+
+		redraw();
+		
+	} // Fin du bloc : mot de passe saisi Correct
+
+} // Fin de la fonction Dashboard::pwd()
+
+
+int main() {
+	
+	try
+	{
+		// Affichage des caractères accentués sous la console et gestion des caractères accentués dans le fichier QIF
+		#ifdef __linux__ 
+			std::setlocale(LC_ALL, "fr_FR.UTF-8");
+			std::setlocale(LC_CTYPE, "fr_FR.UTF-8");
+			std::setlocale(LC_NUMERIC, "fr_FR.UTF-8");
+						
+		#elif _WIN32 // Both 32 bit and 64 bit
+			std::locale::global(std::locale("fr-FR"));
+			
+		#elif __APPLE__
+			std::setlocale(LC_ALL, "fr_FR.UTF-8");
+			std::setlocale(LC_CTYPE, "fr_FR.UTF-8");
+			std::setlocale(LC_NUMERIC, "fr_FR.UTF-8");
+		
+		#else
+
+		#endif
+				
+		Dashboard myDash(Point(10, 10), x_max() - 10, y_max() - 40, "My Dashboard");
+		
+		/*
+		// Chargement manuel des tables
+		// Open a database file
+		SQLite::Database    db("QIF2_params.db3", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+			   
+		// table 1
+		db.exec("DROP TABLE IF EXISTS CumulOps");
+		db.exec("CREATE TABLE CumulOps (value TEXT)");
+		db.exec("INSERT INTO CumulOps VALUES (\"EDF - GDF (Vaucresson)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"EDF (Vaucresson)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"GAZ ENI (Vaucresson)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Eau Vaucresson\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance MRH Vaucresson\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Vaucresson)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts locaux (Vaucresson)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Charges Appt Arboretum\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance IARD Arboretum\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Arboretum)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance IARD AVZ\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Avoriaz)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Honoraires MGFP Avoriaz\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Charges Appt Asnières\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance IARD Asnières\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Asnières)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Charges Appt Arpajon\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance IARD Arpajon\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Arpajon)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Charges Appt Paris\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Assurance MRH Paris\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts fonciers (Paris)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Impôts locaux (Paris)\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Honoraires MGFP YVAOA\")");
+		db.exec("INSERT INTO CumulOps VALUES (\"Loyer\")");
+				
+		SQLite::Statement   query(db, "SELECT * FROM CumulOps");
+			
+		// Loop to execute the query step by step, to get rows of result
+		while (query.executeStep())
+		{
+			// Demonstrate how to get some typed column value
+			string nom = query.getColumn(0);
+			
+			std::wcout << "valeur : " << s2ws(nom) << std::endl;
+		}
+			   		 
+		
+		// Table 2
+		db.exec("DROP TABLE IF EXISTS WebsiteKey");
+		db.exec("CREATE TABLE WebsiteKey (id INTEGER PRIMARY KEY, apikey TEXT, siteweb TEXT)");
+
+		db.exec("INSERT INTO WebsiteKey VALUES (1, \"d601053dd1ab2f9fbbe1\",\"alphavantage.co\")");
+		db.exec("INSERT INTO WebsiteKey VALUES (2, \"KJJV1V6EHC4NKO2XX\", \"free.currencyconverterapi.com\")");
+		
+		// Table 3
+		db.exec("DROP TABLE IF EXISTS Directory");
+		db.exec("CREATE TABLE Directory (id INTEGER PRIMARY KEY, dir_path TEXT, dir_name TEXT)");
+
+		db.exec("INSERT INTO Directory VALUES (1, \"Z:\\Tonic_i6.qif\",\"Fichier exporté Banktivity\")");
+				
+		*/
+	
+		return gui_main();	// Control inversion page 569 de PPP2
+
+	}
+
+
+	catch (runtime_error& e)
+	{	// this code is to produce error messages (console mode)
+		
+		cout << e.what() << '\n';
+		keep_window_open("q");	// For some Windows(tm) setups
+	}
+
+
+}
+
